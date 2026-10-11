@@ -1,0 +1,24 @@
+[project]
+name = "fedmeta"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "agno[agui,os,telegram]>=3.0.11",
+    "openai>=3.19.2",
+    "openrouter>=1.2.32",
+    "pgvector>=0.5.0",
+    "psycopg[binary]>=3.3.6",
+    "sqlalchemy[asyncio]>=2.1.1",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx>=0.27.0",
+    "jsonschema>=4.22.0",
+    "pydantic>=2.7.0",
+    "python-dotenv>=1.0.1",
+    "websockets>=12.0",
+    "huggingface-hub>=2.0.0",
+    "numpy>=2.5.3",
+    "pandas>=3.0.6",
+]
