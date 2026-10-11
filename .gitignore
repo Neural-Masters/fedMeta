@@ -12,3 +12,4 @@ wheels/
 
 fedmeta.db
 desktop/node_modules
+desktop/release/linux-unpacked
