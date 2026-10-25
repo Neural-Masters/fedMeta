@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Brain, RefreshCw, TrendingUp, Shield, Globe } from 'lucide-react'
+import { apiFetch } from '../services/api'
 
 interface Learning {
   learning_id: string
@@ -32,7 +33,7 @@ export default function LearningTab({ userId }: { userId: string }) {
 
   const loadLearnings = async () => {
     try {
-      const res = await fetch(`http://localhost:8000/learning/${userId}`)
+      const res = await apiFetch(`/learning/${encodeURIComponent(userId)}`)
       if (res.ok) setLearnings(await res.json())
     } catch (e) {
       console.error('Failed to load learnings', e)
@@ -41,7 +42,7 @@ export default function LearningTab({ userId }: { userId: string }) {
 
   const loadSyncStatus = async () => {
     try {
-      const res = await fetch(`http://localhost:8000/federated/status/${userId}`)
+      const res = await apiFetch(`/federated/status/${encodeURIComponent(userId)}`)
       if (res.ok) setSyncStatus(await res.json())
     } catch (e) {
       console.error('Failed to load sync status', e)
@@ -51,9 +52,9 @@ export default function LearningTab({ userId }: { userId: string }) {
   const triggerSync = async () => {
     setLoading(true)
     try {
-      await fetch(`http://localhost:8000/federated/sync/${userId}`, { method: 'POST' })
-      loadLearnings()
-      loadSyncStatus()
+      const response = await apiFetch(`/federated/sync/${encodeURIComponent(userId)}`, { method: 'POST' })
+      if (!response.ok) throw new Error('Federated sync failed')
+      await Promise.all([loadLearnings(), loadSyncStatus()])
     } catch (e) {
       console.error('Failed to sync', e)
     }
@@ -66,6 +67,9 @@ export default function LearningTab({ userId }: { userId: string }) {
       error_handling: 'bg-red-500/20 text-red-400',
       preference: 'bg-green-500/20 text-green-400',
       domain: 'bg-purple-500/20 text-purple-400',
+      user_memory: 'bg-amber-500/20 text-amber-300',
+      user_profile: 'bg-cyan-500/20 text-cyan-300',
+      local: 'bg-gray-500/20 text-gray-300',
     }
     return colors[category] || 'bg-gray-500/20 text-gray-400'
   }

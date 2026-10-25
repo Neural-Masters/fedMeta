@@ -46,6 +46,7 @@ class APIEndpoint:
     output_schema: Dict[str, Any] = field(default_factory=dict)
     tags: List[str] = field(default_factory=list)
     is_active: bool = True
+    owner_user_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -64,6 +65,7 @@ class APIEndpoint:
             output_schema=data.get("output_schema", {}),
             tags=data.get("tags", []),
             is_active=data.get("is_active", True),
+            owner_user_id=data.get("owner_user_id"),
         )
 
 
@@ -97,6 +99,7 @@ class APIToolRegistry:
         input_schema: Optional[Dict[str, Any]] = None,
         output_schema: Optional[Dict[str, Any]] = None,
         tags: Optional[List[str]] = None,
+        owner_user_id: Optional[str] = None,
     ) -> APIEndpoint:
         """Register a new API endpoint tool.
 
@@ -116,7 +119,7 @@ class APIToolRegistry:
         Raises:
             ValueError: If a tool with this name already exists.
         """
-        existing = self.get_tool(name)
+        existing = self.get_tool(name, owner_user_id=owner_user_id)
         if existing is not None:
             raise ValueError(f"Tool {name!r} already registered")
 
@@ -129,6 +132,7 @@ class APIToolRegistry:
             input_schema=input_schema or {},
             output_schema=output_schema or {},
             tags=tags or [],
+            owner_user_id=owner_user_id,
         )
         self.session.add(orm_tool)
         self.session.commit()
@@ -136,7 +140,7 @@ class APIToolRegistry:
         logger.info("Registered API tool: %s", name)
         return self._orm_to_dataclass(orm_tool)
 
-    def get_tool(self, name: str) -> Optional[APIEndpoint]:
+    def get_tool(self, name: str, owner_user_id: Optional[str] = None) -> Optional[APIEndpoint]:
         """Get a registered tool by name.
 
         Args:
@@ -145,7 +149,10 @@ class APIToolRegistry:
         Returns:
             The APIEndpoint if found, None otherwise.
         """
-        stmt = select(APIToolRegistryORM).where(APIToolRegistryORM.name == name)
+        stmt = select(APIToolRegistryORM).where(
+            APIToolRegistryORM.name == name,
+            APIToolRegistryORM.owner_user_id == owner_user_id,
+        )
         result = self.session.execute(stmt).scalar_one_or_none()
         if result is None:
             return None
@@ -155,6 +162,7 @@ class APIToolRegistry:
         self,
         active_only: bool = True,
         tags: Optional[List[str]] = None,
+        owner_user_id: Optional[str] = None,
     ) -> List[APIEndpoint]:
         """List registered tools with optional filtering.
 
@@ -166,6 +174,7 @@ class APIToolRegistry:
             List of matching APIEndpoint objects.
         """
         stmt = select(APIToolRegistryORM)
+        stmt = stmt.where(APIToolRegistryORM.owner_user_id == owner_user_id)
         if active_only:
             stmt = stmt.where(APIToolRegistryORM.is_active == True)
         results = self.session.execute(stmt).scalars().all()
@@ -181,6 +190,7 @@ class APIToolRegistry:
         self,
         task_context: str,
         limit: int = 5,
+        owner_user_id: Optional[str] = None,
     ) -> List[APIEndpoint]:
         """Find tools relevant to a task context.
 
@@ -198,7 +208,7 @@ class APIToolRegistry:
         task_lower = task_context.lower()
         task_words = set(task_lower.split())
 
-        tools = self.list_tools(active_only=True)
+        tools = self.list_tools(active_only=True, owner_user_id=owner_user_id)
         scored_tools: List[tuple] = []
 
         for tool in tools:
@@ -225,7 +235,12 @@ class APIToolRegistry:
         scored_tools.sort(key=lambda x: x[0], reverse=True)
         return [tool for _, tool in scored_tools[:limit]]
 
-    def update_tool(self, name: str, updates: Dict[str, Any]) -> Optional[APIEndpoint]:
+    def update_tool(
+        self,
+        name: str,
+        updates: Dict[str, Any],
+        owner_user_id: Optional[str] = None,
+    ) -> Optional[APIEndpoint]:
         """Update a registered tool.
 
         Args:
@@ -235,7 +250,10 @@ class APIToolRegistry:
         Returns:
             The updated APIEndpoint, or None if not found.
         """
-        stmt = select(APIToolRegistryORM).where(APIToolRegistryORM.name == name)
+        stmt = select(APIToolRegistryORM).where(
+            APIToolRegistryORM.name == name,
+            APIToolRegistryORM.owner_user_id == owner_user_id,
+        )
         orm_tool = self.session.execute(stmt).scalar_one_or_none()
         if orm_tool is None:
             return None
@@ -248,7 +266,7 @@ class APIToolRegistry:
         self.session.refresh(orm_tool)
         return self._orm_to_dataclass(orm_tool)
 
-    def deactivate_tool(self, name: str) -> bool:
+    def deactivate_tool(self, name: str, owner_user_id: Optional[str] = None) -> bool:
         """Deactivate a tool (soft delete).
 
         Args:
@@ -257,7 +275,10 @@ class APIToolRegistry:
         Returns:
             True if deactivated, False if not found.
         """
-        stmt = select(APIToolRegistryORM).where(APIToolRegistryORM.name == name)
+        stmt = select(APIToolRegistryORM).where(
+            APIToolRegistryORM.name == name,
+            APIToolRegistryORM.owner_user_id == owner_user_id,
+        )
         orm_tool = self.session.execute(stmt).scalar_one_or_none()
         if orm_tool is None:
             return False
@@ -266,7 +287,7 @@ class APIToolRegistry:
         self.session.commit()
         return True
 
-    def delete_tool(self, name: str) -> bool:
+    def delete_tool(self, name: str, owner_user_id: Optional[str] = None) -> bool:
         """Permanently delete a tool.
 
         Args:
@@ -275,7 +296,10 @@ class APIToolRegistry:
         Returns:
             True if deleted, False if not found.
         """
-        stmt = select(APIToolRegistryORM).where(APIToolRegistryORM.name == name)
+        stmt = select(APIToolRegistryORM).where(
+            APIToolRegistryORM.name == name,
+            APIToolRegistryORM.owner_user_id == owner_user_id,
+        )
         orm_tool = self.session.execute(stmt).scalar_one_or_none()
         if orm_tool is None:
             return False
@@ -303,4 +327,5 @@ class APIToolRegistry:
             output_schema=orm.output_schema or {},
             tags=orm.tags or [],
             is_active=orm.is_active,
+            owner_user_id=orm.owner_user_id,
         )

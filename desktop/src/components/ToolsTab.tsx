@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Plus, Trash2, Power, PowerOff } from 'lucide-react'
+import { apiFetch } from '../services/api'
 
 interface APITool {
   endpoint_id: string
@@ -17,6 +18,7 @@ interface APITool {
 export default function ToolsTab({ userId }: { userId: string }) {
   const [tools, setTools] = useState<APITool[]>([])
   const [showForm, setShowForm] = useState(false)
+  const [formError, setFormError] = useState('')
 
   const emptyForm = {
     name: '',
@@ -36,7 +38,7 @@ export default function ToolsTab({ userId }: { userId: string }) {
 
   const loadTools = async () => {
     try {
-      const res = await fetch(`http://localhost:8000/tools/${userId}`)
+      const res = await apiFetch(`/tools/${encodeURIComponent(userId)}`)
       if (res.ok) setTools(await res.json())
     } catch (e) {
       console.error('Failed to load tools', e)
@@ -44,10 +46,10 @@ export default function ToolsTab({ userId }: { userId: string }) {
   }
 
   const submitTool = async () => {
+    setFormError('')
     try {
-      await fetch(`http://localhost:8000/tools/${userId}`, {
+      const response = await apiFetch(`/tools/${encodeURIComponent(userId)}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...form,
           headers: JSON.parse(form.headers || '{}'),
@@ -56,21 +58,25 @@ export default function ToolsTab({ userId }: { userId: string }) {
           tags: form.tags.split(',').map((t) => t.trim()).filter(Boolean),
         }),
       })
+      if (!response.ok) {
+        const data = await response.json()
+        throw new Error(data.detail || 'Tool registration failed')
+      }
       setShowForm(false)
       setForm(emptyForm)
       loadTools()
-    } catch (e) {
-      console.error('Failed to register tool', e)
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Could not register tool')
     }
   }
 
   const toggleTool = async (tool: APITool) => {
     try {
-      await fetch(`http://localhost:8000/tools/${userId}/${tool.name}`, {
+      const response = await apiFetch(`/tools/${encodeURIComponent(userId)}/${encodeURIComponent(tool.name)}`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ is_active: !tool.is_active }),
       })
+      if (!response.ok) throw new Error('Tool update failed')
       loadTools()
     } catch (e) {
       console.error('Failed to toggle tool', e)
@@ -80,7 +86,8 @@ export default function ToolsTab({ userId }: { userId: string }) {
   const deleteTool = async (name: string) => {
     if (!confirm(`Delete tool "${name}"?`)) return
     try {
-      await fetch(`http://localhost:8000/tools/${userId}/${name}`, { method: 'DELETE' })
+      const response = await apiFetch(`/tools/${encodeURIComponent(userId)}/${encodeURIComponent(name)}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error('Tool deletion failed')
       loadTools()
     } catch (e) {
       console.error('Failed to delete tool', e)
@@ -109,13 +116,13 @@ export default function ToolsTab({ userId }: { userId: string }) {
           <h3 className="text-lg font-semibold text-gray-200 mb-4">Register New API Endpoint</h3>
           <div className="grid grid-cols-2 gap-4 mb-4">
             <div>
-              <label className="block text-sm text-gray-400 mb-1">Tool Name</label>
+              <label className="block text-sm text-gray-400 mb-1">Tool Name (Agno function name)</label>
               <input
                 type="text"
                 value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
                 className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 focus:outline-none focus:border-blue-500"
-                placeholder="e.g., search_docs"
+                placeholder="e.g., web_search"
               />
             </div>
             <div>
@@ -142,23 +149,23 @@ export default function ToolsTab({ userId }: { userId: string }) {
             />
           </div>
           <div className="mb-4">
-            <label className="block text-sm text-gray-400 mb-1">Description</label>
+              <label className="block text-sm text-gray-400 mb-1">Description (tell the agent when to call it)</label>
             <input
               type="text"
               value={form.description}
               onChange={(e) => setForm({ ...form, description: e.target.value })}
               className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 focus:outline-none focus:border-blue-500"
-              placeholder="What does this tool do?"
+              placeholder="Search the web for current information matching a query and return the top results."
             />
           </div>
           <div className="grid grid-cols-2 gap-4 mb-4">
             <div>
-              <label className="block text-sm text-gray-400 mb-1">Headers (JSON)</label>
+              <label className="block text-sm text-gray-400 mb-1">Headers (JSON; use environment placeholders for secrets)</label>
               <textarea
                 value={form.headers}
                 onChange={(e) => setForm({ ...form, headers: e.target.value })}
                 className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 focus:outline-none focus:border-blue-500 h-20 font-mono text-xs"
-                placeholder='{"Authorization": "Bearer ..."}'
+                placeholder='{"Authorization": "Bearer ${WEB_SEARCH_API_TOKEN}", "Content-Type": "application/json"}'
               />
             </div>
             <div>
@@ -167,7 +174,7 @@ export default function ToolsTab({ userId }: { userId: string }) {
                 value={form.input_schema}
                 onChange={(e) => setForm({ ...form, input_schema: e.target.value })}
                 className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 focus:outline-none focus:border-blue-500 h-20 font-mono text-xs"
-                placeholder='{"type": "object", "properties": {...}}'
+                placeholder='{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"],"additionalProperties":false}'
               />
             </div>
           </div>
@@ -181,6 +188,10 @@ export default function ToolsTab({ userId }: { userId: string }) {
               placeholder="search, docs, api"
             />
           </div>
+          <p className="mb-4 text-xs text-gray-500">
+            FedMeta creates an Agno-compatible Python callable for this endpoint and gives Agno the JSON input schema. Keep credentials in the backend environment, not in this form.
+          </p>
+          {formError && <p role="alert" className="mb-4 text-sm text-red-300">{formError}</p>}
           <div className="flex gap-2">
             <button
               onClick={submitTool}

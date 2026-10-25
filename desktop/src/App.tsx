@@ -1,15 +1,50 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import ProfileTab from './components/ProfileTab'
 import ToolsTab from './components/ToolsTab'
 import LearningTab from './components/LearningTab'
 import ChatPanel from './components/ChatPanel'
-import { User, Wrench, Brain, MessageSquare } from 'lucide-react'
+import AuthPanel from './components/AuthPanel'
+import { User, Wrench, Brain, MessageSquare, LogOut } from 'lucide-react'
+import { apiFetch, clearAccessToken, getAccessToken } from './services/api'
 
 type Tab = 'profile' | 'tools' | 'learning' | 'chat'
+interface Account { user_id: string; username: string }
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('profile')
-  const [userId, setUserId] = useState('user_001')
+  const [account, setAccount] = useState<Account | null>(null)
+  const [checkingSession, setCheckingSession] = useState(true)
+
+  useEffect(() => {
+    const token = getAccessToken()
+    if (!token) {
+      setCheckingSession(false)
+      return
+    }
+    apiFetch('/auth/me')
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Session expired')
+        setAccount(await response.json())
+      })
+      .catch(() => clearAccessToken())
+      .finally(() => setCheckingSession(false))
+  }, [])
+
+  const signOut = async () => {
+    try { await apiFetch('/auth/logout', { method: 'POST' }) } catch { /* clear local session regardless */ }
+    clearAccessToken()
+    setAccount(null)
+    setActiveTab('profile')
+  }
+
+  if (checkingSession) {
+    return <div className="flex h-screen items-center justify-center bg-gray-900 text-gray-400">Checking local session…</div>
+  }
+  if (!account) {
+    return <AuthPanel onAuthenticated={(_token, user) => setAccount(user)} />
+  }
+
+  const userId = account.user_id
 
   const tabs = [
     { id: 'profile' as Tab, label: 'Profile', icon: User },
@@ -29,14 +64,17 @@ export default function App() {
           <p className="text-xs text-gray-400 mt-1">Adaptive Profile Framework</p>
         </div>
 
-        <div className="p-4 border-b border-gray-700">
-          <label className="text-xs text-gray-400 block mb-1">User ID</label>
-          <input
-            type="text"
-            value={userId}
-            onChange={(e) => setUserId(e.target.value)}
-            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 focus:outline-none focus:border-blue-500"
-          />
+        <div className="flex items-center gap-3 border-b border-gray-700 p-4">
+          <div className="flex h-9 w-9 items-center justify-center rounded-full bg-gray-700 text-sm font-semibold text-blue-300">
+            {account.username.slice(0, 1).toUpperCase()}
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-medium text-gray-200">{account.username}</p>
+            <p className="text-xs text-gray-500">Signed in</p>
+          </div>
+          <button onClick={signOut} title="Sign out" className="rounded-lg p-2 text-gray-500 transition hover:bg-gray-700 hover:text-gray-200">
+            <LogOut size={16} />
+          </button>
         </div>
 
         <ul className="flex-1 p-4 space-y-1">

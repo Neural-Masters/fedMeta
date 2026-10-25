@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { Send, Bot, User, Loader2, Sparkles, History } from 'lucide-react'
+import { apiFetch } from '../services/api'
 
 interface Message {
   id?: string
@@ -28,7 +29,7 @@ export default function ChatPanel({ userId }: { userId: string }) {
     setHistoryError('')
     setHistoryLoading(true)
 
-    fetch(`http://localhost:8000/agent/history/${encodeURIComponent(userId)}?last_n_runs=50`, {
+    apiFetch(`/agent/history/${encodeURIComponent(userId)}?last_n_runs=50`, {
       signal: controller.signal,
     })
       .then(async (res) => {
@@ -87,7 +88,7 @@ export default function ChatPanel({ userId }: { userId: string }) {
     chatRequestRef.current = controller
 
     try {
-      const res = await fetch('http://localhost:8000/agent/chat/stream', {
+      const res = await apiFetch('/agent/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user_id: userId, message: userMessage.content }),

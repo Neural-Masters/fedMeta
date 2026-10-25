@@ -18,12 +18,14 @@ from fedMeta.tools.api_tool_registry import APIToolRegistry
 from fedMeta.tools.executor import APIToolExecutor
 from agno.models.openai import OpenAIResponses, OpenAIChat
 from agno.models.nvidia import Nvidia
+from agno.models.mistral import MistralChat
+from agno.models.groq import Groq
 
 logger = logging.getLogger(__name__)
 
 # LLM for reasoning (NVIDIA-hosted deepseek, configurable via .env)
-LLM = Nvidia(
-    api_key=os.getenv("NVIDIA_LLM_API"),
+LLM = Groq(
+    api_key=os.getenv("GROQ_API"),
     id=os.getenv("NVIDIA_LLM_MODEL"),
 )
 
@@ -41,13 +43,19 @@ Your capabilities:
 Always respect user privacy. Never share raw user data.
 Adapt your communication style to match the user's profile.
 
-Use search_learnings when relevant to recall reusable knowledge. Use the
-FedMeta save_learning tool to retain a reusable insight locally. Set
-share_globally=true only when the user explicitly asks to share that
-generalized insight with other users; never share personal preferences,
-identifiers, private task details, raw prompts, or tool output. Provide an
-evidence-based confidence score from 0 to 1; items below the configured
-federation threshold remain local.
+Use the registered API tools directly whenever they fit the request. For a web
+search or current-information request, call the user's web-search API tool
+before answering; do not merely describe how you would search. Delegate to a
+sub-agent only for complex or multi-step tasks. If a tool returns an error,
+explain that honestly rather than claiming the call succeeded.
+
+Use search_my_learnings to recall this user's private saved notes, and
+search_learnings for reusable global knowledge. Use the FedMeta save_learning
+tool to retain an insight privately. Set share_globally=true only when the user
+explicitly asks to share that generalized insight with other users; never share
+personal preferences, identifiers, private task details, raw prompts, or tool
+output. Provide an evidence-based confidence score from 0 to 1; items below the
+configured federation threshold remain private.
 """
 
 DEFAULT_SUB_AGENT_PROMPT = """You are a specialized sub-agent spawned by the FedMeta Orchestrator.
@@ -127,6 +135,10 @@ def build_meta_agent(
 
     # Add sub-agent spawning tool
     meta_tools.append(create_sub_agent_spawner(user_id, behavior_adapter))
+    if user_id:
+        # Add account tools directly to the orchestrator so simple API tasks
+        # can execute without requiring a sub-agent tool call first.
+        meta_tools.extend(behavior_adapter.get_available_tools_for_user(user_id, limit=10))
 
     # Get learning machine configuration
     learning_config: Dict[str, Any] = {}
@@ -171,8 +183,9 @@ def build_meta_agent(
 
                 learned_knowledge_store.fedmeta_pending_candidates = []
                 meta_tools.append(
-                    create_federated_learning_tool(learned_knowledge_store)
+                    create_federated_learning_tool(learned_knowledge_store, user_id)
                 )
+                meta_tools.append(create_private_learning_search_tool(learned_knowledge_store, user_id))
             except (ImportError, Exception) as e:
                 logger.warning("Could not configure learned knowledge: %s", e)
 
@@ -203,7 +216,7 @@ def build_meta_agent(
     return agent
 
 
-def create_federated_learning_tool(learned_store: Any) -> Any:
+def create_federated_learning_tool(learned_store: Any, user_id: str) -> Any:
     """Create guarded local-save tool, optionally marking an item for sharing.
 
     The actual federated network operation happens after the Agno run returns,
@@ -237,13 +250,23 @@ def create_federated_learning_tool(learned_store: Any) -> Any:
             learning=learning,
             context=context,
             tags=tags,
-            namespace="global",
+            user_id=user_id,
+            namespace="user",
         )
         if not saved:
-            return "Could not save this learning to the local Agno knowledge store."
+            return "Could not save this learning to your private Agno knowledge store."
 
         threshold = get_settings().confidence_threshold
         if share_globally and confidence >= threshold:
+            globally_saved = learned_store.save(
+                title=title,
+                learning=learning,
+                context=context,
+                tags=tags,
+                namespace="global",
+            )
+            if not globally_saved:
+                return "Saved to your private memory, but it could not be added to the local global-knowledge index. Nothing was federated."
             learned_store.fedmeta_pending_candidates.append(
                 {
                     "title": title,
@@ -256,13 +279,48 @@ def create_federated_learning_tool(learned_store: Any) -> Any:
             return "Saved locally and queued for anonymous federation after this run."
         if share_globally:
             return (
-                f"Saved locally only; confidence {confidence:.2f} is below the "
+                f"Saved to your private memory only; confidence {confidence:.2f} is below the "
                 f"federation threshold {threshold:.2f}."
             )
-        return "Saved locally only; no learning was sent to the federation server."
+        return "Saved to your private memory only; no learning was sent to the federation server."
 
     save_learning.__name__ = "save_learning"
     return save_learning
+
+
+def create_private_learning_search_tool(learned_store: Any, user_id: str) -> Any:
+    """Search only the signed-in user's private LearnedKnowledge namespace."""
+
+    def search_my_learnings(query: str, limit: int = 5) -> str:
+        """Search this user's private saved notes; never searches other users' notes.
+
+        Args:
+            query: What private note or preference to recall.
+            limit: Maximum results to return (1-10).
+        """
+        import json
+
+        results = learned_store.search(
+            query=query,
+            user_id=user_id,
+            namespace="user",
+            limit=max(1, min(int(limit), 10)),
+        )
+        return json.dumps(
+            [
+                {
+                    "title": getattr(item, "title", ""),
+                    "learning": getattr(item, "learning", ""),
+                    "context": getattr(item, "context", None),
+                    "tags": getattr(item, "tags", []) or [],
+                }
+                for item in results
+            ],
+            ensure_ascii=False,
+        )
+
+    search_my_learnings.__name__ = "search_my_learnings"
+    return search_my_learnings
 
 
 def build_sub_agent(

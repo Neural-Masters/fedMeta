@@ -13,18 +13,28 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+import hmac
+import re
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from fedMeta.config import get_settings
-from fedMeta.database import get_db_manager
-from fedMeta.database import SharedLearningORM
+from fedMeta.database import (
+    AuthSessionORM,
+    SharedLearningORM,
+    UserAccountORM,
+    UserProfileORM,
+    get_db_manager,
+)
+from fedMeta.auth import create_session_token, hash_password, hash_session_token, normalize_username, verify_password
 from fedMeta.federated.sanitizer import LearningSanitizer
 
 logger = logging.getLogger(__name__)
@@ -74,7 +84,7 @@ class ProfileUpdateRequest(BaseModel):
 
 
 class ToolRegisterRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     url: str
     method: str = "GET"
     description: Optional[str] = None
@@ -99,6 +109,77 @@ class ChatResponse(BaseModel):
     response: str
     user_id: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class CredentialsRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=10, max_length=128)
+
+
+@dataclass(frozen=True)
+class AuthenticatedUser:
+    user_id: str
+    username: str
+    token_hash: str
+
+
+def get_current_user(authorization: Optional[str] = Header(default=None)) -> AuthenticatedUser:
+    """Validate a bearer session token and resolve its account identity."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Sign in to continue", headers={"WWW-Authenticate": "Bearer"})
+
+    token = authorization[7:].strip()
+    if not token or len(token) > 256:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    token_hash = hash_session_token(token)
+    session = get_db_manager().get_session()
+    try:
+        result = session.execute(
+            select(AuthSessionORM, UserAccountORM)
+            .join(UserAccountORM, AuthSessionORM.user_id == UserAccountORM.user_id)
+            .where(
+                AuthSessionORM.token_hash == token_hash,
+                AuthSessionORM.revoked_at.is_(None),
+            )
+        ).first()
+        if result is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        auth_session, account = result
+        expires_at = auth_session.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        return AuthenticatedUser(
+            user_id=account.user_id,
+            username=account.username,
+            token_hash=token_hash,
+        )
+    finally:
+        session.close()
+
+
+def require_path_user(
+    user_id: str,
+    current: AuthenticatedUser = Depends(get_current_user),
+) -> AuthenticatedUser:
+    """Ensure a caller cannot read or mutate another account's path-scoped data."""
+    if not hmac.compare_digest(user_id, current.user_id):
+        raise HTTPException(status_code=403, detail="You cannot access another account's data")
+    return current
+
+
+def _issue_session(session: Any, user_id: str) -> tuple[str, datetime]:
+    token = create_session_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    session.add(
+        AuthSessionORM(
+            user_id=user_id,
+            token_hash=hash_session_token(token),
+            expires_at=expires_at,
+        )
+    )
+    return token, expires_at
 
 
 class FederatedContribution(BaseModel):
@@ -193,6 +274,43 @@ def _persist_contributions(
         session.close()
 
 
+def _format_private_learning(content: Any) -> str:
+    """Format an Agno user-memory/profile payload without rendering owner IDs."""
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError:
+            return content.strip()
+    if isinstance(content, list):
+        return "\n".join(
+            text for item in content if (text := _format_private_learning(item))
+        )
+    if isinstance(content, dict):
+        memories = content.get("memories")
+        if isinstance(memories, list):
+            return "\n".join(
+                text for item in memories if (text := _format_private_learning(item))
+            )
+        private_fields = {
+            "user_id", "agent_id", "team_id", "created_at", "updated_at",
+            "id", "namespace",
+        }
+        lines = []
+        for key, value in content.items():
+            if key in private_fields or value is None or value == "":
+                continue
+            if isinstance(value, (dict, list)):
+                rendered = _format_private_learning(value)
+            else:
+                rendered = str(value)
+            if rendered:
+                lines.append(f"{key.replace('_', ' ').title()}: {rendered}")
+        return "\n".join(lines)
+    if content is None:
+        return ""
+    return str(content)
+
+
 @app.on_event("startup")
 async def initialize_database() -> None:
     """Ensure app-owned tables, including the durable federated store, exist."""
@@ -200,6 +318,103 @@ async def initialize_database() -> None:
     global federation_listener_task
     if settings.federated_listener_enabled:
         federation_listener_task = asyncio.create_task(_federation_listener())
+
+
+@app.post("/auth/register", status_code=201)
+async def register_account(req: CredentialsRequest):
+    """Create a local account without email verification."""
+    username = req.username.strip()
+    try:
+        normalized = normalize_username(username)
+        password_hash = hash_password(req.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    session = get_db_manager().get_session()
+    try:
+        existing = session.execute(
+            select(UserAccountORM).where(UserAccountORM.username_normalized == normalized)
+        ).scalar_one_or_none()
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="That username is already registered")
+
+        user_id = str(uuid4())
+        account = UserAccountORM(
+            user_id=user_id,
+            username=username,
+            username_normalized=normalized,
+            password_hash=password_hash,
+        )
+        session.add(account)
+        session.add(UserProfileORM(user_id=user_id, name=username))
+        session.flush()
+        token, expires_at = _issue_session(session, user_id)
+        session.commit()
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_at": expires_at.isoformat(),
+            "user": {"user_id": user_id, "username": username},
+        }
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as exc:
+        session.rollback()
+        logger.exception("Local account registration failed")
+        # Hide DB details but tell the caller if a concurrent username claim won.
+        if "unique" in str(exc).lower():
+            raise HTTPException(status_code=409, detail="That username is already registered") from exc
+        raise HTTPException(status_code=503, detail="Could not create the local account") from exc
+    finally:
+        session.close()
+
+
+@app.post("/auth/login")
+async def login_account(req: CredentialsRequest):
+    """Verify local credentials and issue a 30-day opaque bearer token."""
+    try:
+        normalized = normalize_username(req.username)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    session = get_db_manager().get_session()
+    try:
+        account = session.execute(
+            select(UserAccountORM).where(UserAccountORM.username_normalized == normalized)
+        ).scalar_one_or_none()
+        if account is None or not verify_password(req.password, account.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        token, expires_at = _issue_session(session, account.user_id)
+        session.commit()
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_at": expires_at.isoformat(),
+            "user": {"user_id": account.user_id, "username": account.username},
+        }
+    finally:
+        session.close()
+
+
+@app.get("/auth/me")
+async def who_am_i(current: AuthenticatedUser = Depends(get_current_user)):
+    return {"user_id": current.user_id, "username": current.username}
+
+
+@app.post("/auth/logout")
+async def logout(current: AuthenticatedUser = Depends(get_current_user)):
+    session = get_db_manager().get_session()
+    try:
+        token_session = session.execute(
+            select(AuthSessionORM).where(AuthSessionORM.token_hash == current.token_hash)
+        ).scalar_one_or_none()
+        if token_session is not None:
+            token_session.revoked_at = datetime.now(timezone.utc)
+            session.commit()
+        return {"status": "ok"}
+    finally:
+        session.close()
 
 
 async def _federation_listener() -> None:
@@ -253,7 +468,7 @@ async def stop_federation_listener() -> None:
 # --- Profile Endpoints ---
 
 @app.get("/profile/{user_id}")
-async def get_profile(user_id: str):
+async def get_profile(user_id: str, _current: AuthenticatedUser = Depends(require_path_user)):
     """Get user profile."""
     db = get_db_manager()
     session = db.get_session()
@@ -277,7 +492,11 @@ async def get_profile(user_id: str):
 
 
 @app.post("/profile/{user_id}")
-async def save_profile(user_id: str, req: ProfileUpdateRequest):
+async def save_profile(
+    user_id: str,
+    req: ProfileUpdateRequest,
+    _current: AuthenticatedUser = Depends(require_path_user),
+):
     """Create or update user profile."""
     db = get_db_manager()
     session = db.get_session()
@@ -312,13 +531,13 @@ async def save_profile(user_id: str, req: ProfileUpdateRequest):
 # --- Tools Endpoints ---
 
 @app.get("/tools/{user_id}")
-async def list_tools(user_id: str):
+async def list_tools(user_id: str, _current: AuthenticatedUser = Depends(require_path_user)):
     """List all registered tools."""
     db = get_db_manager()
     session = db.get_session()
     try:
         from fedMeta.database import APIToolRegistryORM
-        tools = session.query(APIToolRegistryORM).all()
+        tools = session.query(APIToolRegistryORM).filter_by(owner_user_id=user_id).all()
         return [
             {
                 "endpoint_id": t.id,
@@ -339,18 +558,37 @@ async def list_tools(user_id: str):
 
 
 @app.post("/tools/{user_id}")
-async def register_tool(user_id: str, req: ToolRegisterRequest):
+async def register_tool(
+    user_id: str,
+    req: ToolRegisterRequest,
+    _current: AuthenticatedUser = Depends(require_path_user),
+):
     """Register a new API endpoint tool."""
     db = get_db_manager()
     session = db.get_session()
     try:
         from fedMeta.database import APIToolRegistryORM
-        existing = session.query(APIToolRegistryORM).filter_by(name=req.name).first()
+        secret_header_names = {"authorization", "x-api-key", "api-key", "x-auth-token"}
+        for header_name, header_value in req.headers.items():
+            if header_name.casefold() in secret_header_names and not re.search(
+                r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", header_value
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Header {header_name!r} appears to contain a secret. "
+                        "Use an environment placeholder such as ${WEB_SEARCH_API_TOKEN}."
+                    ),
+                )
+        existing = session.query(APIToolRegistryORM).filter_by(
+            name=req.name, owner_user_id=user_id
+        ).first()
         if existing:
             raise HTTPException(status_code=409, detail=f"Tool '{req.name}' already exists")
         
         tool = APIToolRegistryORM(
             name=req.name,
+            owner_user_id=user_id,
             url=req.url,
             method=req.method.upper(),
             description=req.description,
@@ -367,13 +605,20 @@ async def register_tool(user_id: str, req: ToolRegisterRequest):
 
 
 @app.patch("/tools/{user_id}/{tool_name}")
-async def update_tool(user_id: str, tool_name: str, req: ToolUpdateRequest):
+async def update_tool(
+    user_id: str,
+    tool_name: str,
+    req: ToolUpdateRequest,
+    _current: AuthenticatedUser = Depends(require_path_user),
+):
     """Update a tool's status."""
     db = get_db_manager()
     session = db.get_session()
     try:
         from fedMeta.database import APIToolRegistryORM
-        tool = session.query(APIToolRegistryORM).filter_by(name=tool_name).first()
+        tool = session.query(APIToolRegistryORM).filter_by(
+            name=tool_name, owner_user_id=user_id
+        ).first()
         if not tool:
             raise HTTPException(status_code=404, detail="Tool not found")
         
@@ -391,13 +636,19 @@ async def update_tool(user_id: str, tool_name: str, req: ToolUpdateRequest):
 
 
 @app.delete("/tools/{user_id}/{tool_name}")
-async def delete_tool(user_id: str, tool_name: str):
+async def delete_tool(
+    user_id: str,
+    tool_name: str,
+    _current: AuthenticatedUser = Depends(require_path_user),
+):
     """Delete a tool."""
     db = get_db_manager()
     session = db.get_session()
     try:
         from fedMeta.database import APIToolRegistryORM
-        tool = session.query(APIToolRegistryORM).filter_by(name=tool_name).first()
+        tool = session.query(APIToolRegistryORM).filter_by(
+            name=tool_name, owner_user_id=user_id
+        ).first()
         if not tool:
             raise HTTPException(status_code=404, detail="Tool not found")
         session.delete(tool)
@@ -410,7 +661,7 @@ async def delete_tool(user_id: str, tool_name: str):
 # --- Learning Endpoints ---
 
 @app.get("/learning/{user_id}")
-async def get_learnings(user_id: str):
+async def get_learnings(user_id: str, _current: AuthenticatedUser = Depends(require_path_user)):
     """Return local Agno learnings plus centrally federated learnings."""
     db = get_db_manager()
     session = db.get_session()
@@ -439,9 +690,13 @@ async def get_learnings(user_id: str):
     try:
         from fedMeta.learning.shared_knowledge import SharedKnowledgeManager
 
-        for row in SharedKnowledgeManager(namespace="global").get_all_learnings(limit=200):
+        for row in SharedKnowledgeManager(namespace="user").get_all_learnings(
+            limit=200,
+            namespace="user",
+            user_id=user_id,
+        ):
             metadata = row.get("meta_data") or {}
-            if metadata.get("namespace") != "global":
+            if metadata.get("namespace") != "user" or metadata.get("user_id") != user_id:
                 continue
             raw_content = row.get("content") or ""
             try:
@@ -464,7 +719,7 @@ async def get_learnings(user_id: str):
                 "content": content,
                 "category": "local",
                 "confidence": confidence,
-                "namespace": "global",
+                "namespace": "user",
                 "scope": "local",
                 "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at or ""),
             })
@@ -472,6 +727,77 @@ async def get_learnings(user_id: str):
         # PostgreSQL/PgVector may be unavailable while the UI still needs to
         # display durable centrally federated learnings.
         logger.exception("Could not read local Agno learnings for the dashboard")
+
+    # Agno's user_memory and user_profile stores are persisted in its own
+    # PostgresDb learnings table, not in the PgVector knowledge table above.
+    # Include those records too; otherwise AGENTIC memory/profile updates work
+    # in chat but appear missing from this dashboard.
+    try:
+        from agno.db.postgres import PostgresDb
+
+        agno_db = PostgresDb(
+            db_url=get_settings().database_url,
+            learnings_table="agno_learnings_store",
+            db_schema="ai",
+        )
+        for learning_type, title in (
+            ("user_memory", "User memory"),
+            ("user_profile", "Learned user profile"),
+        ):
+            records = agno_db.get_learnings(
+                learning_type=learning_type,
+                user_id=user_id,
+                limit=100,
+            )
+            for record in records:
+                structured_content = record.get("content")
+                memory_items = (
+                    structured_content.get("memories")
+                    if learning_type == "user_memory" and isinstance(structured_content, dict)
+                    else None
+                )
+                if isinstance(memory_items, list) and memory_items:
+                    for memory_index, memory in enumerate(memory_items):
+                        content = _format_private_learning(memory)
+                        if not content.strip():
+                            continue
+                        local_items.append({
+                            "learning_id": f"agno:{record.get('id')}:{memory_index}",
+                            "title": (
+                                str(memory.get("topic") or memory.get("title") or title)
+                                if isinstance(memory, dict)
+                                else title
+                            ),
+                            "content": content,
+                            "category": learning_type,
+                            "confidence": 0.0,
+                            "namespace": "user",
+                            "scope": "local",
+                            "created_at": str(record.get("updated_at") or record.get("created_at") or ""),
+                        })
+                    continue
+
+                content = _format_private_learning(structured_content)
+                if not content.strip():
+                    continue
+                record_id = str(record.get("id") or f"{learning_type}-{len(local_items)}")
+                created_at = record.get("updated_at") or record.get("created_at")
+                if isinstance(created_at, datetime):
+                    created_at = created_at.isoformat()
+                elif isinstance(created_at, (int, float)):
+                    created_at = datetime.fromtimestamp(created_at, timezone.utc).isoformat()
+                local_items.append({
+                    "learning_id": f"agno:{record_id}",
+                    "title": title,
+                    "content": content,
+                    "category": learning_type,
+                    "confidence": 0.0,
+                    "namespace": "user",
+                    "scope": "local",
+                    "created_at": str(created_at or ""),
+                })
+    except Exception:
+        logger.exception("Could not read Agno user memory/profile for the dashboard")
 
     combined = local_items + federated_items
     combined.sort(key=lambda item: item["created_at"], reverse=True)
@@ -481,7 +807,7 @@ async def get_learnings(user_id: str):
 # --- Federated Sync Endpoints ---
 
 @app.get("/federated/status/{user_id}")
-async def get_sync_status(user_id: str):
+async def get_sync_status(user_id: str, _current: AuthenticatedUser = Depends(require_path_user)):
     """Get federated sync status."""
     db = get_db_manager()
     session = db.get_session()
@@ -525,7 +851,7 @@ async def get_sync_status(user_id: str):
 
 
 @app.post("/federated/sync/{user_id}")
-async def trigger_sync(user_id: str):
+async def trigger_sync(user_id: str, _current: AuthenticatedUser = Depends(require_path_user)):
     """Retry the local outbox and apply newly received global rules."""
     try:
         from fedMeta.agent_builder import build_meta_agent
@@ -547,8 +873,13 @@ async def trigger_sync(user_id: str):
 # --- Agent Chat ---
 
 @app.post("/agent/chat", response_model=ChatResponse)
-async def agent_chat(req: ChatRequest):
+async def agent_chat(
+    req: ChatRequest,
+    current: AuthenticatedUser = Depends(get_current_user),
+):
     """Chat with the FedMeta agent."""
+    if not hmac.compare_digest(req.user_id, current.user_id):
+        raise HTTPException(status_code=403, detail="Chat user does not match signed-in account")
     try:
         from fedMeta.agent_builder import build_meta_agent
         from fedMeta.learning.behavior_adapter import BehaviorAdapter
@@ -600,8 +931,13 @@ async def agent_chat(req: ChatRequest):
 
 
 @app.post("/agent/chat/stream")
-async def agent_chat_stream(req: ChatRequest):
+async def agent_chat_stream(
+    req: ChatRequest,
+    current: AuthenticatedUser = Depends(get_current_user),
+):
     """Stream Agno text deltas to the desktop client using Server-Sent Events."""
+    if not hmac.compare_digest(req.user_id, current.user_id):
+        raise HTTPException(status_code=403, detail="Chat user does not match signed-in account")
     try:
         from fedMeta.agent_builder import build_meta_agent
         from fedMeta.learning.behavior_adapter import BehaviorAdapter
@@ -671,6 +1007,7 @@ async def agent_chat_stream(req: ChatRequest):
 async def get_agent_history(
     user_id: str,
     last_n_runs: int = Query(default=50, ge=1, le=100),
+    _current: AuthenticatedUser = Depends(require_path_user),
 ):
     """Return persisted user/assistant text from this user's Agno session only."""
     try:

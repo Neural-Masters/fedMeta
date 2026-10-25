@@ -16,11 +16,14 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Float,
+    ForeignKey,
     Integer,
     String,
     Text,
     UniqueConstraint,
     create_engine,
+    inspect as sa_inspect,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -57,13 +60,50 @@ class UserProfileORM(Base):
     )
 
 
+class UserAccountORM(Base):
+    """Local username/password account; only a salted password hash is stored."""
+
+    __tablename__ = "user_accounts"
+
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    username: Mapped[str] = mapped_column(String(32), nullable=False)
+    username_normalized: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class AuthSessionORM(Base):
+    """Opaque, expiring bearer sessions stored as token hashes."""
+
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("user_accounts.user_id"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
 class APIToolRegistryORM(Base):
     """Database model for registered API endpoint tools."""
 
     __tablename__ = "api_tool_registry"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    owner_user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     url: Mapped[str] = mapped_column(String(2048), nullable=False)
     method: Mapped[str] = mapped_column(String(10), default="GET")
@@ -74,6 +114,9 @@ class APIToolRegistryORM(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "name", name="uq_api_tool_registry_owner_name"),
     )
 
 
@@ -198,9 +241,50 @@ class DatabaseManager:
         return self._session_factory
 
     def create_tables(self) -> None:
-        """Create all database tables."""
+        """Create tables and safely migrate existing tool registry ownership."""
         Base.metadata.create_all(self.engine)
+        self._migrate_tool_ownership()
         logger.info("Database tables created successfully")
+
+    def _migrate_tool_ownership(self) -> None:
+        """Add per-user tool ownership and replace the old globally-unique name index."""
+        inspector = sa_inspect(self.engine)
+        if not inspector.has_table("api_tool_registry"):
+            return
+
+        columns = {column["name"] for column in inspector.get_columns("api_tool_registry")}
+        with self.engine.begin() as connection:
+            if "owner_user_id" not in columns:
+                connection.execute(
+                    text("ALTER TABLE api_tool_registry ADD COLUMN owner_user_id VARCHAR(36)")
+                )
+
+            # Prior schema used a global unique index on tool name. Remove only
+            # that specific index; legacy rows stay unowned and hidden from accounts.
+            refreshed = sa_inspect(connection)
+            for index in refreshed.get_indexes("api_tool_registry"):
+                if index.get("unique") and index.get("column_names") == ["name"]:
+                    index_name = index["name"].replace('"', '""')
+                    connection.execute(text(f'DROP INDEX IF EXISTS "{index_name}"'))
+
+            unique_pairs = [
+                tuple(constraint.get("column_names") or [])
+                for constraint in refreshed.get_unique_constraints("api_tool_registry")
+            ]
+            indexes = refreshed.get_indexes("api_tool_registry")
+            has_owner_name = ("owner_user_id", "name") in unique_pairs or any(
+                index.get("unique")
+                and tuple(index.get("column_names") or []) == ("owner_user_id", "name")
+                for index in indexes
+            )
+            if not has_owner_name:
+                connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_api_tool_registry_owner_name "
+                        "ON api_tool_registry (owner_user_id, name)"
+                    )
+                )
 
     def get_session(self):
         """Get a new database session."""

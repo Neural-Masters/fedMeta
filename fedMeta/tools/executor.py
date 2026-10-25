@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -141,25 +143,31 @@ class APIToolExecutor:
     def create_tool_function(
         self,
         endpoint: APIEndpoint,
-    ) -> Callable:
-        """Create an Agno-compatible tool function from an APIEndpoint.
+    ) -> Any:
+        """Create an Agno Function backed by a real Python endpoint callable.
 
-        The returned callable has a signature compatible with Agno's
-        tool system.  When invoked by an agent, it validates inputs,
-        executes the HTTP call, and returns the result.
+        The endpoint's JSON Schema is supplied directly to Agno, while the
+        Python entrypoint performs schema validation and the HTTP request.
 
         Args:
             endpoint: The APIEndpoint to wrap.
 
         Returns:
-            A callable tool function.
+            An Agno ``Function`` exposing the endpoint schema and Python entrypoint.
         """
+        from agno.tools.function import Function
+
+        agno_name = re.sub(r"[^A-Za-z0-9_-]", "_", endpoint.name).strip("_")[:64]
+        if not agno_name:
+            agno_name = "api_tool"
+        if agno_name[0].isdigit():
+            agno_name = f"tool_{agno_name}"
 
         def tool_function(**kwargs: Any) -> str:
-            """Execute the {name} API endpoint.
+            """Execute the registered API endpoint using its JSON input schema.
 
             Args:
-                **kwargs: Parameters matching the endpoint's input schema.
+                **kwargs: Named arguments defined by the endpoint's JSON Schema.
 
             Returns:
                 JSON string of the execution result.
@@ -168,15 +176,42 @@ class APIToolExecutor:
             return json.dumps(result.to_dict(), default=str, indent=2)
 
         # Set function metadata for Agno discovery
-        tool_function.__name__ = endpoint.name
-        tool_function.__doc__ = endpoint.description or f"Call {endpoint.name}"
+        tool_function.__name__ = agno_name
+        tool_function.__doc__ = endpoint.description or (
+            f"Call the {endpoint.method.upper()} API endpoint {endpoint.name}. "
+            "Arguments are the fields in this tool's input schema."
+        )
 
-        return tool_function
+        # `**kwargs` is useful for a dynamic Python wrapper, but its inferred
+        # schema is empty. Give Agno the endpoint's explicit schema so the LLM
+        # can see required inputs such as `query` and produce valid tool calls.
+        schema = dict(endpoint.input_schema or {})
+        schema.pop("$schema", None)
+        schema.pop("$id", None)
+        schema.pop("title", None)
+        schema.setdefault("type", "object")
+        if not isinstance(schema.get("properties"), dict):
+            schema["properties"] = {}
+        schema.setdefault("additionalProperties", False)
+        required = schema.get("required") or []
+        schema["required"] = [
+            key for key in required
+            if key in schema["properties"]
+        ]
+
+        return Function(
+            name=agno_name,
+            description=(endpoint.description or f"Call {endpoint.name}")
+            + f" HTTP {endpoint.method.upper()} endpoint.",
+            parameters=schema,
+            entrypoint=tool_function,
+            skip_entrypoint_processing=True,
+        )
 
     def create_tool_functions(
         self,
         endpoints: List[APIEndpoint],
-    ) -> List[Callable]:
+    ) -> List[Any]:
         """Create tool functions for multiple endpoints.
 
         Args:
@@ -194,7 +229,7 @@ class APIToolExecutor:
     ) -> httpx.Response:
         """Make the actual HTTP request with retry logic."""
         method = endpoint.method.upper()
-        headers = dict(endpoint.headers)
+        headers = self._resolve_headers(endpoint.headers)
 
         last_error: Optional[Exception] = None
 
@@ -249,3 +284,19 @@ class APIToolExecutor:
         # All retries exhausted
         assert last_error is not None
         raise last_error
+
+    @staticmethod
+    def _resolve_headers(headers: Dict[str, str]) -> Dict[str, str]:
+        """Expand `${ENV_VAR}` placeholders without storing API secrets in DB."""
+        resolved: Dict[str, str] = {}
+        placeholder = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+        for header_name, header_value in headers.items():
+            def replace(match: re.Match[str]) -> str:
+                variable = match.group(1)
+                value = os.getenv(variable)
+                if not value:
+                    raise ValueError(f"Required tool credential environment variable {variable} is not set")
+                return value
+
+            resolved[header_name] = placeholder.sub(replace, str(header_value))
+        return resolved

@@ -64,13 +64,14 @@ class SharedKnowledgeManager:
         if self._vector_db is None:
             try:
                 from agno.knowledge.embedder.huggingface import HuggingfaceCustomEmbedder
+                from agno.knowledge.embedder.mistral import MistralEmbedder
 
                 # MiniLM produces 384-dim vectors; dimensions must match the
                 # PgVector column size or inserts will fail.
-                embedder = embedder or HuggingfaceCustomEmbedder(
-                    id="sentence-transformers/all-MiniLM-L6-v2",
+                embedder = embedder or MistralEmbedder(
+                    id="mistral-embed",
                     dimensions=384,
-                    api_key=os.getenv("HUGGINGFACE_API"),
+                    api_key=os.getenv("MISTRAL_API"),
                 )
             except ImportError:
                 logger.warning(
@@ -198,8 +199,10 @@ class SharedKnowledgeManager:
     def get_all_learnings(
         self,
         limit: int = 100,
+        namespace: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Read all learnings from the vector store (for federated push).
+        """Read local Agno knowledge documents, optionally scoped to an owner.
 
         Returns:
             List of dicts with content, metadata and timestamps.
@@ -209,15 +212,40 @@ class SharedKnowledgeManager:
             import sqlalchemy as sa
 
             with self._vector_db.db_engine.connect() as conn:
+                filters = []
+                parameters: Dict[str, Any] = {"limit": limit}
+                if namespace is not None:
+                    filters.append("meta_data->>'namespace' = :namespace")
+                    parameters["namespace"] = namespace
+                if namespace == "user":
+                    if not user_id:
+                        return []
+                    filters.append("meta_data->>'user_id' = :user_id")
+                    parameters["user_id"] = user_id
+                where = f"WHERE {' AND '.join(filters)} " if filters else ""
                 result = conn.execute(
                     sa.text(
                         "SELECT id, name, content, meta_data, created_at "
-                        "FROM public.agno_learnings ORDER BY created_at DESC LIMIT :limit"
+                        f"FROM public.agno_learnings {where}"
+                        "ORDER BY created_at DESC LIMIT :limit"
                     ),
-                    {"limit": limit},
+                    parameters,
                 )
                 rows = result.mappings().all()
-            return [dict(r) for r in rows]
+            documents = [dict(row) for row in rows]
+            if namespace is not None:
+                documents = [
+                    row for row in documents
+                    if (row.get("meta_data") or {}).get("namespace") == namespace
+                ]
+            if namespace == "user":
+                if not user_id:
+                    return []
+                documents = [
+                    row for row in documents
+                    if (row.get("meta_data") or {}).get("user_id") == user_id
+                ]
+            return documents[:limit]
         except Exception as e:
             logger.error("Failed to read learnings: %s", e)
             return []

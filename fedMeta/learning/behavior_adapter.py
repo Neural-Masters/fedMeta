@@ -96,6 +96,7 @@ Adapt your responses to match the user's expertise level, communication style, a
         relevant_endpoints = self.tool_registry.find_relevant_tools(
             task_context=enhanced_context,
             limit=limit,
+            owner_user_id=user_id,
         )
 
         # Wrap into callable functions
@@ -106,6 +107,21 @@ Adapt your responses to match the user's expertise level, communication style, a
             user_id,
         )
         return tool_functions
+
+    def get_available_tools_for_user(self, user_id: str, limit: int = 10) -> List[Any]:
+        """Return this user's active API tools as Agno Python-backed Functions.
+
+        These tools are attached to the Meta-Agent itself so simple requests
+        (for example, web search) do not depend on the model first spawning a
+        sub-agent. Sub-agents still get task-relevant tools separately.
+        """
+        endpoints = self.tool_registry.list_tools(
+            active_only=True,
+            owner_user_id=user_id,
+        )[:limit]
+        functions = self.tool_executor.create_tool_functions(endpoints)
+        logger.info("Loaded %d account API tools for user_id=%s", len(functions), user_id)
+        return functions
 
     def get_learning_config(
         self,
